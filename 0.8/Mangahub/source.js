@@ -1085,7 +1085,7 @@ var _Sources = (() => {
   var MH_API_DOMAIN = "https://api.mghcdn.com/graphql";
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.1.4",
+    version: "3.1.5",
     name: "Mangahub",
     icon: "icon.png",
     author: "Netsky",
@@ -1262,6 +1262,8 @@ var _Sources = (() => {
       if (data.data.manga.chapters?.length == 0) throw new Error(`Failed to parse chapters property from manga object mangaId:${mangaId}`);
       return parseChapters(data.data.manga.chapters, mangaId);
     }
+    // Key cache is per extension instance; no key material is persisted.
+    chapterCryptoKeys = {};
     async getChapterDetails(mangaId, chapterId) {
       const load = async () => {
         const request = App.createRequest({
@@ -1279,11 +1281,13 @@ var _Sources = (() => {
         const response = await this.requestManager.schedule(request, 1);
         const body = response.data;
         if (typeof body !== "string" || !body.trim().startsWith("{")) {
-          throw new Error("MangaHub: chapter API returned HTML or an invalid response");
+          const err = new Error("MangaHub: chapter API returned HTML or an invalid response");
+          err.isAccessError = true;
+          throw err;
         }
         let data;
         try { data = JSON.parse(body); }
-        catch { throw new Error("MangaHub: chapter API returned malformed JSON"); }
+        catch { const err = new Error("MangaHub: chapter API returned malformed JSON"); err.isAccessError = true; throw err; }
         if (Array.isArray(data.errors) && data.errors.length) {
           const message = data.errors.map(e => e.message || "GraphQL error").join("; ");
           const err = new Error("MangaHub chapter API: " + message);
@@ -1296,18 +1300,33 @@ var _Sources = (() => {
         if (pageString.startsWith("enc:v1:")) {
           const parts = pageString.split(":");
           if (parts.length !== 6) throw new Error("MangaHub: unsupported encrypted chapter format");
-          const cryptoRequest = App.createRequest({
-            url: MH_DOMAIN + "/api/chapter-crypto",
-            method: "GET",
-            headers: { "Accept": "application/json" }
-          });
-          const cryptoResponse = await this.requestManager.schedule(cryptoRequest, 1);
-          let cryptoParams;
-          try { cryptoParams = JSON.parse(cryptoResponse.data); }
-          catch { throw new Error("MangaHub: chapter encryption keys unavailable"); }
           const keyId = parts[2];
-          const keyData = cryptoParams.keys?.[keyId] ??
-            ((cryptoParams.keyId == null || cryptoParams.keyId === keyId) ? cryptoParams.key : null);
+          let keyData = this.chapterCryptoKeys[keyId];
+          if (!keyData) {
+            const cookieStore = this.requestManager?.cookieStore;
+            const storedCookies = cookieStore?.getAllCookies() || [];
+            const cookies = storedCookies.filter(c => c.domain?.includes("mangahub.io"))
+              .map(c => c.name + "=" + c.value);
+            const stored = String(await this.getMhubAccess() || "");
+            const token = stored.replace(/^mhub_access=/, "").split(";")[0];
+            if (token && !cookies.some(c => c.startsWith("mhub_access="))) cookies.push("mhub_access=" + token);
+            const cryptoRequest = App.createRequest({
+              url: MH_DOMAIN + "/api/chapter-crypto",
+              method: "GET",
+              headers: {
+                "Accept": "application/json",
+                ...(cookies.length ? { "Cookie": cookies.join("; ") } : {})
+              }
+            });
+            const cryptoResponse = await this.requestManager.schedule(cryptoRequest, 1);
+            let cryptoParams;
+            try { cryptoParams = JSON.parse(cryptoResponse.data); }
+            catch { const err = new Error("MangaHub: chapter encryption keys unavailable"); err.isAccessError = true; throw err; }
+            if (cryptoParams.keys) Object.assign(this.chapterCryptoKeys, cryptoParams.keys);
+            if (cryptoParams.key && cryptoParams.keyId) this.chapterCryptoKeys[cryptoParams.keyId] = cryptoParams.key;
+            keyData = this.chapterCryptoKeys[keyId] ??
+              ((cryptoParams.keyId == null || cryptoParams.keyId === keyId) ? cryptoParams.key : null);
+          }
           if (!keyData) {
             const err = new Error("MangaHub: chapter encryption key not found");
             err.isAccessError = true;
@@ -1323,6 +1342,7 @@ var _Sources = (() => {
             const decrypted = sjcl.mode.gcm.decrypt(aes, encrypted, iv, [], 128);
             pageString = sjcl.codec.utf8String.fromBits(decrypted);
           } catch (error) {
+            delete this.chapterCryptoKeys[keyId];
             throw new Error("MangaHub: AES-GCM chapter decryption failed: " + String(error));
           }
         }
