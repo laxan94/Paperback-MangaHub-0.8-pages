@@ -1085,7 +1085,7 @@ var _Sources = (() => {
   var MH_API_DOMAIN = "https://api.mghcdn.com/graphql";
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.1.1",
+    version: "3.1.2",
     name: "Mangahub",
     icon: "icon.png",
     author: "Netsky",
@@ -1201,57 +1201,54 @@ var _Sources = (() => {
       return parseChapters(data.data.manga.chapters, mangaId);
     }
     async getChapterDetails(mangaId, chapterId) {
-      const request = App.createRequest({
-        url: MH_API_DOMAIN,
-        method: "POST",
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json"
-        },
-        data: {
-          query: `query {
-                    chapter(x: m01, slug: "${mangaId}", number: ${Number(chapterId)}) {
-                      pages
-                      title
-                      slug
-                    }
-                  }
-                  `
+      const load = async () => {
+        const request = App.createRequest({
+          url: MH_API_DOMAIN,
+          method: "POST",
+          headers: { "Accept": "application/json", "Content-Type": "application/json" },
+          data: { query: `query {
+            chapter(x: m01, slug: "${mangaId}", number: ${Number(chapterId)}) {
+              pages
+              title
+              slug
+            }
+          }` }
+        });
+        const response = await this.requestManager.schedule(request, 1);
+        const body = response.data;
+        if (typeof body !== "string" || !body.trim().startsWith("{")) {
+          throw new Error("MangaHub: chapter API returned HTML or an invalid response");
         }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      let data;
-      try {
-        data = JSON.parse(response.data);
-      } catch (e) {
-        throw new Error("MangaHub: chapter API returned non-JSON (possible access challenge)");
-      }
-      if (data?.errors?.length) {
-        const message = data.errors.map((error) => error.message || "GraphQL error").join("; ");
-        if (/rate.limit|api.key|access|unauthori[sz]ed/i.test(message)) await this.refreshAPIKey();
-        throw new Error("MangaHub chapter API: " + message);
-      }
-      if (!data.data?.chapter?.pages) throw new Error(`Failed to parse chapter or pages property from data object mangaId:${mangaId} chapterId:${chapterId}`);
-      const pages = [];
-      try {
-        const parsedPages = JSON.parse(data.data.chapter.pages);
-        if (typeof parsedPages.p !== "string" || !Array.isArray(parsedPages.i) || !parsedPages.i.length) {
-          throw new Error("MangaHub: malformed pages payload");
+        let data;
+        try { data = JSON.parse(body); }
+        catch { throw new Error("MangaHub: chapter API returned malformed JSON"); }
+        if (Array.isArray(data.errors) && data.errors.length) {
+          const message = data.errors.map(e => e.message || "GraphQL error").join("; ");
+          const err = new Error("MangaHub chapter API: " + message);
+          err.isAccessError = /limit|access|key|auth|forbidden|expired|token/i.test(message);
+          throw err;
         }
-        for (const img of parsedPages.i) {
-          if (typeof img !== "string" || !img) throw new Error("MangaHub: invalid page path");
-          const path = (parsedPages.p + img).replace(/^\\/+/, "");
-          if (/^https?:\\/\\//i.test(path)) throw new Error("MangaHub: unexpected absolute page URL");
-          pages.push(`${MH_CDN_DOMAIN}/${path}`);
+        if (!data.data?.chapter?.pages) throw new Error("MangaHub: chapter pages missing");
+        let payload;
+        try { payload = JSON.parse(data.data.chapter.pages); }
+        catch { throw new Error("MangaHub: invalid chapter pages JSON"); }
+        if (typeof payload.p !== "string" || !Array.isArray(payload.i) || !payload.i.length) {
+          throw new Error("MangaHub: invalid chapter page list");
         }
-      } catch (e) {
-        throw new Error(`${e}`);
+        const pages = payload.i.map(img => {
+          if (typeof img !== "string" || !img) throw new Error("MangaHub: invalid image path");
+          const imagePath = (payload.p + img).replace(/^\/+/, "");
+          if (/^https?:\/\//i.test(imagePath)) throw new Error("MangaHub: unexpected image URL");
+          return `${MH_CDN_DOMAIN}/${imagePath}`;
+        });
+        return App.createChapterDetails({ id: chapterId, mangaId, pages });
+      };
+      try { return await load(); }
+      catch (error) {
+        if (!error?.isAccessError) throw error;
+        await this.refreshAPIKey();
+        return await load();
       }
-      return App.createChapterDetails({
-        id: chapterId,
-        mangaId,
-        pages
-      });
     }
     async getSearchTags() {
       const request = App.createRequest({
@@ -1493,6 +1490,9 @@ var _Sources = (() => {
         metadata
       });
     }
+    async getCloudflareBypassRequest() {
+      return this.getCloudflareBypassRequestAsync();
+    }
     async getCloudflareBypassRequestAsync() {
       await this.stateManager.store("userAgent", "null");
       return App.createRequest({
@@ -1506,9 +1506,6 @@ var _Sources = (() => {
     }
     async refreshAPIKey() {
       await this.stateManager.store("mhub_key", "mhub_access=; Max-Age=0; Path=/");
-      this.requestManager?.cookieStore?.getAllCookies().forEach((x) => {
-        this.requestManager?.cookieStore?.removeCookie(x);
-      });
       const request = App.createRequest({
         url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
         method: "GET",
@@ -1519,18 +1516,17 @@ var _Sources = (() => {
         }
       });
       const response = await this.requestManager.schedule(request, 1);
-      const cookieHeaders = response.headers["Set-Cookie"];
+      const cookieHeaders = response.headers?.["Set-Cookie"] || response.headers?.["set-cookie"] || "";
       let mhub_key = "";
       if (cookieHeaders) {
-        const match = /mhub_access=([^;]+)/.exec(cookieHeaders);
+        const match = /mhub_access=([^;]+)/.exec(Array.isArray(cookieHeaders) ? cookieHeaders.join("; ") : cookieHeaders);
         if (match) {
           const mhubAccess = match[1] ?? "";
           mhub_key = mhubAccess;
         }
       }
-      const now = Date.now();
-      const expires = now + 2 * 60 * 60 * 24 * 31;
-      await this.stateManager.store("mhub_key", `mhub_access=${mhub_key}; Max-Age=${expires}; Path=/`);
+      if (!mhub_key) throw new Error("MangaHub: no mhub_access cookie returned; open Cloudflare bypass in Paperback");
+      await this.stateManager.store("mhub_key", `mhub_access=${mhub_key}`);
     }
   };
   return __toCommonJS(Mangahub_exports);
