@@ -1085,7 +1085,7 @@ var _Sources = (() => {
   var MH_API_DOMAIN = "https://api.mghcdn.com/graphql";
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.1.3",
+    version: "3.1.4",
     name: "Mangahub",
     icon: "icon.png",
     author: "Netsky",
@@ -1287,7 +1287,7 @@ var _Sources = (() => {
         if (Array.isArray(data.errors) && data.errors.length) {
           const message = data.errors.map(e => e.message || "GraphQL error").join("; ");
           const err = new Error("MangaHub chapter API: " + message);
-          err.isAccessError = /limit|access|key|auth|forbidden|expired|token/i.test(message);
+          err.isAccessError = /limit|access|key|auth|forbidden|expired|token|encrypt/i.test(message);
           throw err;
         }
         if (!data.data?.chapter?.pages) throw new Error("MangaHub: chapter pages missing");
@@ -1308,7 +1308,11 @@ var _Sources = (() => {
           const keyId = parts[2];
           const keyData = cryptoParams.keys?.[keyId] ??
             ((cryptoParams.keyId == null || cryptoParams.keyId === keyId) ? cryptoParams.key : null);
-          if (!keyData) throw new Error("MangaHub: chapter encryption key not found");
+          if (!keyData) {
+            const err = new Error("MangaHub: chapter encryption key not found");
+            err.isAccessError = true;
+            throw err;
+          }
           try {
             const key = sjcl.codec.base64url.toBits(keyData);
             const iv = sjcl.codec.base64url.toBits(parts[3]);
@@ -1342,7 +1346,7 @@ var _Sources = (() => {
       try { return await load(); }
       catch (error) {
         if (!error?.isAccessError) throw error;
-        await this.refreshAPIKey();
+        await this.refreshAPIKey(mangaId, chapterId);
         return await load();
       }
     }
@@ -1600,29 +1604,33 @@ var _Sources = (() => {
         }
       });
     }
-    async refreshAPIKey() {
-      await this.stateManager.store("mhub_key", "mhub_access=; Max-Age=0; Path=/");
-      const request = App.createRequest({
-        url: `${MH_DOMAIN}/chapter/the-last-human/chapter-1?reloadKey=1`,
-        method: "GET",
-        headers: {
-          "Referer": `${MH_DOMAIN}/`,
-          "User-Agent": await this.requestManager.getDefaultUserAgent(),
-          "Cookie": await this.stateManager.retrieve("mhub_key")
-        }
-      });
-      const response = await this.requestManager.schedule(request, 1);
-      const cookieHeaders = response.headers?.["Set-Cookie"] || response.headers?.["set-cookie"] || "";
-      let mhub_key = "";
-      if (cookieHeaders) {
-        const match = /mhub_access=([^;]+)/.exec(Array.isArray(cookieHeaders) ? cookieHeaders.join("; ") : cookieHeaders);
-        if (match) {
-          const mhubAccess = match[1] ?? "";
-          mhub_key = mhubAccess;
-        }
+    async refreshAPIKey(mangaId, chapterId) {
+      const previous = String(await this.getMhubAccess() || "").replace(/^mhub_access=/, "").split(";")[0];
+      const slug = encodeURIComponent(mangaId || "martial-peak");
+      const chapter = Number(chapterId);
+      const chapterPath = `${MH_DOMAIN}/chapter/${slug}/chapter-${Number.isFinite(chapter) ? chapter : 1}`;
+      const ua = await this.requestManager.getDefaultUserAgent();
+      for (const url of [chapterPath + "?reloadKey=1", chapterPath]) {
+        try {
+          const response = await this.requestManager.schedule(App.createRequest({
+            url, method: "GET",
+            headers: { "Referer": `${MH_DOMAIN}/manga/${slug}`, "User-Agent": ua }
+          }), 1);
+          const h = response.headers || {};
+          const cookieHeaders = h["Set-Cookie"] || h["set-cookie"] || "";
+          const cookieText = Array.isArray(cookieHeaders) ? cookieHeaders.join("; ") : String(cookieHeaders);
+          const match = /mhub_access=([^;\s,]+)/.exec(cookieText);
+          if (match?.[1] && match[1] !== previous) {
+            await this.stateManager.store("mhub_key", "mhub_access=" + match[1]);
+            return;
+          }
+        } catch (e) { /* Try alternate chapter URL before falling back. */ }
       }
-      if (!mhub_key) throw new Error("MangaHub: no mhub_access cookie returned; open Cloudflare bypass in Paperback");
-      await this.stateManager.store("mhub_key", `mhub_access=${mhub_key}`);
+      // MangaHub's current API also accepts a fresh random 16-byte access identifier.
+      // Never overwrite the previously stored key with an empty cookie.
+      let randomKey = "";
+      for (let i = 0; i < 16; i++) randomKey += Math.floor(Math.random() * 256).toString(16).padStart(2, "0");
+      await this.stateManager.store("mhub_key", "mhub_access=" + randomKey);
     }
   };
   return __toCommonJS(Mangahub_exports);
