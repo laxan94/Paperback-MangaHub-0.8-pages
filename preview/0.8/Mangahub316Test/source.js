@@ -1104,12 +1104,12 @@ var _Sources = (() => {
   }
   var MH_CDN_DOMAIN = "https://imgx.mghcdn.com";
   var MangahubInfo = {
-    version: "3.1.6",
-    name: "Mangahub 3.1.6 TEST",
+    version: "3.1.7",
+    name: "Mangahub 3.1.7 TEST",
     icon: "icon.png",
     author: "Netsky",
     authorWebsite: "https://github.com/TheNetsky",
-    description: "MangaHub 3.1.6 isolated Paperback test source",
+    description: "Experimental chapter-session repair, does not replace the original MangaHub source",
     contentRating: import_types2.ContentRating.MATURE,
     websiteBaseURL: MH_DOMAIN,
     sourceTags: [
@@ -1195,11 +1195,23 @@ var _Sources = (() => {
               "Origin": MH_DOMAIN,
               "User-Agent": await this.requestManager.getDefaultUserAgent()
             };
-            // Do not leak the API token to HTML, images, or key-refresh requests.
+            // Send valid session credentials only to MangaHub's own API paths.
             delete headers["x-mhub-access"];
-            if (request.url === MH_API_DOMAIN) {
+            const graphQL = request.url === MH_API_DOMAIN;
+            const chapterCrypto = request.url === MH_DOMAIN + "/api/chapter-crypto";
+            if (graphQL || chapterCrypto) {
               const access = await this.getMhubAccess();
-              if (access) headers["x-mhub-access"] = access;
+              if (access) {
+                headers["x-mhub-access"] = access;
+                // Paperback 0.8 may not automatically forward its WebView cookie store.
+                if (graphQL) {
+                  const current = String(headers.Cookie || headers.cookie || "");
+                  if (!/(?:^|;\s*)mhub_access=/i.test(current)) {
+                    headers.Cookie = (current ? current.replace(/;?\s*$/, "; ") : "") +
+                      "mhub_access=" + access;
+                  }
+                }
+              }
             }
             request.headers = headers;
             return request;
@@ -1350,9 +1362,12 @@ var _Sources = (() => {
               }
             });
             const cryptoResponse = await this.requestManager.schedule(cryptoRequest, 1);
+            if (cryptoResponse.status < 200 || cryptoResponse.status >= 300) {
+              throw new Error("MangaHub: chapter-crypto HTTP " + cryptoResponse.status);
+            }
             let cryptoParams;
             try { cryptoParams = JSON.parse(cryptoResponse.data); }
-            catch { const err = new Error("MangaHub: chapter encryption keys unavailable"); err.isAccessError = true; throw err; }
+            catch { throw new Error("MangaHub: chapter-crypto returned non-JSON data"); }
             if (cryptoParams.keys) Object.assign(this.chapterCryptoKeys, cryptoParams.keys);
             if (cryptoParams.key && cryptoParams.keyId) this.chapterCryptoKeys[cryptoParams.keyId] = cryptoParams.key;
             keyData = this.chapterCryptoKeys[keyId] ??
@@ -1397,8 +1412,15 @@ var _Sources = (() => {
       try { return await load(); }
       catch (error) {
         if (!error?.isAccessError) throw error;
+        // One renewal attempt only; no rapid repeated requests or fabricated keys.
         await this.refreshAPIKey(mangaId, chapterId);
-        return await load();
+        try { return await load(); }
+        catch (retryError) {
+          if (/Chapter encryption unavailable/i.test(String(retryError?.message))) {
+            throw new Error("MangaHub: chapter encryption unavailable after authenticated session refresh; the chapter API still refuses page data");
+          }
+          throw retryError;
+        }
       }
     }
     async getSearchTags() {
@@ -1661,10 +1683,20 @@ var _Sources = (() => {
       const previous = await this.getMhubAccess();
       const store = this.requestManager?.cookieStore;
       const userAgent = await this.requestManager.getDefaultUserAgent();
-      for (const url of [MH_DOMAIN + "/?reloadKey=1", MH_DOMAIN + "/"]) {
+      const slug = String(mangaId ?? "").trim();
+      const number = String(chapterId ?? "").trim();
+      const validSlug = /^[a-z0-9][a-z0-9_-]{0,199}$/i.test(slug);
+      const validChapter = /^\d+(?:\.\d+)?$/.test(number);
+      const chapterURL = validSlug && validChapter
+        ? MH_DOMAIN + "/chapter/" + encodeURIComponent(slug) +
+          "/chapter-" + encodeURIComponent(number) + "?reloadKey=1"
+        : null;
+      const urls = chapterURL ? [chapterURL, MH_DOMAIN + "/"] : [MH_DOMAIN + "/"];
+      for (const url of urls) {
         const response = await this.requestManager.schedule(App.createRequest({
           url, method: "GET", headers: {
-            "Referer": MH_DOMAIN + "/", "User-Agent": userAgent
+            "Referer": validSlug ? MH_DOMAIN + "/manga/" + encodeURIComponent(slug) : MH_DOMAIN + "/",
+            "User-Agent": userAgent
           }
         }), 1);
         if (response.status === 403 || response.status === 503) {
