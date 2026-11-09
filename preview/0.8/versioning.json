@@ -1,11 +1,11 @@
 {
-  "buildTime": "2026-11-09T02:03:51.718Z",
+  "buildTime": "2026-11-09T02:23:01.420Z",
   "sources": [
     {
-      "id": "Mangahub",
-      "name": "Mangahub",
+      "id": "Mangahub316Test",
+      "name": "Mangahub 3.1.6 TEST",
       "author": "Netsky",
-      "desc": "Extension that pulls manga from mangahub.io",
+      "desc": "Isolated test extension — keep your normal MangaHub source installed",
       "website": "https://github.com/TheNetsky",
       "contentRating": "MATURE",
       "version": "3.1.6",
