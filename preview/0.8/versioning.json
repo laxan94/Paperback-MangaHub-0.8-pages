@@ -1,0 +1,27 @@
+{
+  "buildTime": "2026-11-09T02:03:51.718Z",
+  "sources": [
+    {
+      "id": "Mangahub",
+      "name": "Mangahub",
+      "author": "Netsky",
+      "desc": "Extension that pulls manga from mangahub.io",
+      "website": "https://github.com/TheNetsky",
+      "contentRating": "MATURE",
+      "version": "3.1.6",
+      "icon": "icon.png",
+      "tags": [
+        {
+          "text": "Buggy",
+          "type": "danger"
+        }
+      ],
+      "websiteBaseURL": "https://mangahub.io",
+      "intents": 21
+    }
+  ],
+  "builtWith": {
+    "toolchain": "0.8.7",
+    "types": "0.8.7"
+  }
+}
