@@ -1,14 +1,14 @@
 {
-  "buildTime": "2026-11-09T02:23:01.420Z",
+  "buildTime": "2026-11-09T02:44:08.049Z",
   "sources": [
     {
       "id": "Mangahub316Test",
-      "name": "Mangahub 3.1.6 TEST",
+      "name": "Mangahub 3.1.7 TEST",
       "author": "Netsky",
-      "desc": "Isolated test extension — keep your normal MangaHub source installed",
+      "desc": "Experimental MangaHub reader authentication recovery for Paperback 0.8",
       "website": "https://github.com/TheNetsky",
       "contentRating": "MATURE",
-      "version": "3.1.6",
+      "version": "3.1.7",
       "icon": "icon.png",
       "tags": [
         {
