@@ -1,0 +1,39 @@
+name: MangaHub 0.9
+on:
+  pull_request:
+    paths: ["src/**", "scripts/**", "package.json", "tsconfig.json", ".github/workflows/mangahub-0.9.yml"]
+  push:
+    branches: [main]
+    paths: ["src/**", "scripts/**", "package.json", "tsconfig.json", ".github/workflows/mangahub-0.9.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install --no-audit --no-fund
+      - run: npm run check
+      - run: npm run bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mangahub-0.9-bundle
+          path: bundles/
+      - name: Publish /0.9 without modifying /0.8
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          mkdir -p 0.9
+          cp -R bundles/. 0.9/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add 0.9
+          if ! git diff --cached --quiet; then
+            git commit -m "build(0.9): publish MangaHub extension"
+            git push
+          fi

@@ -1,0 +1,389 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+/* Copyright © 2026 kittycatgit */
+/* Adaptations copyright © 2026 laxan94 */
+
+import {
+  CookieStorageInterceptor,
+  DiscoverSectionType,
+  type Chapter,
+  type ChapterDetails,
+  type Cookie,
+  type DiscoverSection,
+  type DiscoverSectionItem,
+  type ExtensionImpl,
+  type Metadata,
+  type PagedResults,
+  type Request,
+  type SearchQuery,
+  type SearchResultItem,
+  type SortingOption,
+  type SourceManga,
+  type Tag,
+} from "@paperback/types";
+
+import { gqlString, MangaHubApi } from "./api";
+import { decryptEncV1 } from "./crypto";
+import { MangaHubSearchForm } from "./forms";
+import {
+  DEFAULT_SORT,
+  GENRE_CACHE_TTL,
+  GENRE_STATE_KEY,
+  GENRES,
+  GENRES_SECTION_ID,
+  LATEST_PAGE_SIZE,
+  LATEST_SECTION_ID,
+  PAGE_SIZE,
+  POPULAR_UPDATES_SECTION_ID,
+  SORTED_SECTIONS,
+  SORTING_OPTIONS,
+  SOURCE,
+  type ApiChapterFull,
+  type ApiGenre,
+  type ApiManga,
+  type ApiSearch,
+  type MangaHubSearchMetadata,
+} from "./models";
+import { MangaHubInterceptor } from "./network";
+import {
+  contentRatingOf,
+  coverUrl,
+  parseChapterPages,
+  parseChapters,
+  parseMangaDetails,
+} from "./parsers";
+import type pbconfigType from "./pbconfig";
+
+const LIST_FIELDS =
+  "id,rank,title,slug,status,image,latestChapter,genres,author,isSafe,isLicensed,updatedDate";
+
+class MangaHubExtension implements ExtensionImpl<typeof pbconfigType> {
+  private readonly cookieStorage = new CookieStorageInterceptor({ storage: "stateManager" });
+
+  private readonly interceptor = new MangaHubInterceptor("main");
+
+  private readonly api = new MangaHubApi(this.interceptor);
+
+  async initialise(): Promise<void> {
+    this.cookieStorage.registerInterceptor();
+    this.interceptor.registerInterceptor();
+  }
+
+  async getMangaDetails(mangaId: string): Promise<SourceManga> {
+    const data = await this.api.query<{ manga?: ApiManga }>(
+      `{manga(x:${SOURCE},slug:${gqlString(mangaId)}){id,rank,title,alternativeTitle,slug,mainSlug,status,image,latestChapter,genres,author,artist,isWebtoon,isYaoi,isPorn,isSoftPorn,isSafe,isLicensed,description,createdDate,updatedDate,chapters{id,number,title,slug,date}}}`,
+    );
+
+    if (!data.manga) {
+      throw new Error(`No title found for ${mangaId}`);
+    }
+
+    return parseMangaDetails(data.manga);
+  }
+
+  async getChapters(sourceManga: SourceManga): Promise<Chapter[]> {
+    const data = await this.api.query<{ manga?: ApiManga }>(
+      `{manga(x:${SOURCE},slug:${gqlString(sourceManga.mangaId)}){id,chapters{id,number,title,slug,date}}}`,
+    );
+
+    return parseChapters(data.manga?.chapters ?? [], sourceManga);
+  }
+
+  async getChapterDetails(chapter: Chapter): Promise<ChapterDetails> {
+    const mangaId = chapter.sourceManga.mangaId;
+    const number = Number(chapter.chapterId);
+    if (!Number.isFinite(number) || number < 0) {
+      throw new Error(`Invalid MangaHub chapter number: ${chapter.chapterId}`);
+    }
+
+    const { data, keys } = await this.api.queryChapter<{ chapter?: ApiChapterFull }>(
+      `{chapter(x:${SOURCE},slug:${gqlString(mangaId)},number:${number}){id,mangaID,number,title,slug,date,pages,s}}`,
+    );
+
+    if (!data.chapter) {
+      throw new Error(`Chapter ${chapter.chapterId} is no longer listed for ${mangaId}`);
+    }
+
+    // The page list arrives as AES-GCM ciphertext keyed to the request's access token.
+    const payload = data.chapter.pages;
+    const pages = parseChapterPages({
+      ...data.chapter,
+      pages: payload?.startsWith("enc:v1:") ? decryptEncV1(payload, keys) : payload,
+    });
+
+    if (pages.length === 0) {
+      throw new Error(`Unable to read any pages for chapter ${chapter.chapterId}`);
+    }
+
+    return { id: chapter.chapterId, mangaId, pages };
+  }
+
+  private async genreTags(): Promise<Tag[]> {
+    const cached = Application.getState(GENRE_STATE_KEY) as
+      | { at?: number; genres?: Tag[] }
+      | undefined;
+
+    if (
+      cached?.genres &&
+      cached.genres.length > 0 &&
+      typeof cached.at === "number" &&
+      Date.now() - cached.at < GENRE_CACHE_TTL
+    ) {
+      return cached.genres;
+    }
+
+    try {
+      const data = await this.api.query<{ genres?: ApiGenre[] }>(`{genres{id,slug,title}}`);
+
+      const genres = (data.genres ?? [])
+        .filter((genre) => genre?.slug && genre?.title)
+        .map((genre) => ({ id: genre.slug, title: genre.title }))
+        .sort((a, b) => a.title.localeCompare(b.title));
+
+      if (genres.length > 0) {
+        Application.setState({ at: Date.now(), genres }, GENRE_STATE_KEY);
+        return genres;
+      }
+    } catch {
+      /* fall back to the bundled list */
+    }
+
+    return cached?.genres && cached.genres.length > 0 ? cached.genres : GENRES;
+  }
+
+  async getSortingOptions(): Promise<SortingOption[]> {
+    return SORTING_OPTIONS;
+  }
+
+  async getAdvancedSearchForm(query: SearchQuery<Metadata>): Promise<MangaHubSearchForm> {
+    return new MangaHubSearchForm(
+      query.metadata as MangaHubSearchMetadata | undefined,
+      await this.genreTags(),
+    );
+  }
+
+  private searchArgs(
+    title: string,
+    sort: string,
+    filters: MangaHubSearchMetadata,
+    offset: number,
+    limit: number,
+  ): string {
+    // A comma-joined list of slugs, or "all" for no filter. An unknown slug
+    // makes the resolver throw, so only slugs we offered are sent.
+    const genre = filters.genres && filters.genres.length > 0 ? filters.genres.join(",") : "all";
+
+    return [
+      `x:${SOURCE}`,
+      `q:${gqlString(title)}`,
+      `genre:${gqlString(genre)}`,
+      `mod:${sort}`,
+      ...(filters.hideNSFW ? ["hideNSFW:true"] : []),
+      ...(filters.hideYaoi ? ["hideYaoi:true"] : []),
+      ...(filters.hideLicensed ? ["hideLicensed:true"] : []),
+      `limit:${limit}`,
+      `offset:${offset}`,
+      "count:true",
+    ].join(",");
+  }
+
+  async getSearchResults(
+    query: SearchQuery<Metadata>,
+    metadata: Metadata | undefined,
+    sortingOption: SortingOption | undefined,
+  ): Promise<PagedResults<SearchResultItem>> {
+    const paging = metadata as MangaHubSearchMetadata | undefined;
+
+    if (paging?.completed) {
+      return { items: [] };
+    }
+
+    const filters = (paging ??
+      (query.metadata as MangaHubSearchMetadata | undefined) ??
+      {}) as MangaHubSearchMetadata;
+    const offset = paging?.offset ?? 0;
+    const sort = paging?.sort ?? sortingOption?.id ?? DEFAULT_SORT;
+
+    const data = await this.api.query<{ search?: ApiSearch }>(
+      `{search(${this.searchArgs((query.title ?? "").trim(), sort, filters, offset, PAGE_SIZE)}){rows{${LIST_FIELDS}},count}}`,
+    );
+
+    const rows = data.search?.rows ?? [];
+    const total = data.search?.count ?? 0;
+    const nextOffset = offset + rows.length;
+
+    return {
+      items: rows.map((row) => this.searchItem(row)),
+      metadata:
+        rows.length > 0 && nextOffset < total
+          ? {
+              offset: nextOffset,
+              sort,
+              ...(filters.genres && filters.genres.length > 0 ? { genres: filters.genres } : {}),
+              ...(filters.hideNSFW ? { hideNSFW: true } : {}),
+              ...(filters.hideYaoi ? { hideYaoi: true } : {}),
+              ...(filters.hideLicensed ? { hideLicensed: true } : {}),
+            }
+          : { completed: true },
+    };
+  }
+
+  private searchItem(row: ApiManga): SearchResultItem {
+    return {
+      mangaId: row.slug,
+      title: row.title?.trim() || row.slug,
+      imageUrl: coverUrl(row.image),
+      contentRating: contentRatingOf(row),
+      ...(typeof row.latestChapter === "number"
+        ? { subtitle: `Chapter ${row.latestChapter}` }
+        : {}),
+    };
+  }
+
+  async getDiscoverSections(): Promise<DiscoverSection[]> {
+    return [
+      {
+        id: POPULAR_UPDATES_SECTION_ID,
+        title: "Popular Updates",
+        type: DiscoverSectionType.featured,
+      },
+      { id: LATEST_SECTION_ID, title: "Latest Updates", type: DiscoverSectionType.chapterUpdates },
+      ...SORTED_SECTIONS.map((section) => ({
+        id: section.id,
+        title: section.title,
+        type: DiscoverSectionType.simpleCarousel,
+      })),
+      { id: GENRES_SECTION_ID, title: "Genres", type: DiscoverSectionType.genres },
+    ];
+  }
+
+  async getDiscoverSectionItems(
+    section: DiscoverSection,
+    metadata?: Metadata,
+  ): Promise<PagedResults<DiscoverSectionItem>> {
+    const paging = metadata as MangaHubSearchMetadata | undefined;
+
+    if (paging?.completed) {
+      return { items: [] };
+    }
+
+    if (section.id === GENRES_SECTION_ID) {
+      const genres = await this.genreTags();
+
+      return {
+        items: genres.map((genre) => ({
+          type: "genresCarouselItem" as const,
+          name: genre.title,
+          searchQuery: { title: "", metadata: { genres: [genre.id] } },
+        })),
+        metadata: { completed: true },
+      };
+    }
+
+    if (section.id === POPULAR_UPDATES_SECTION_ID) {
+      // latestPopular takes no paging arguments; it answers with a fixed set.
+      const data = await this.api.query<{ latestPopular?: ApiManga[] }>(
+        `{latestPopular(x:${SOURCE}){id,title,slug,image,latestChapter,isSafe,isLicensed}}`,
+      );
+
+      return {
+        items: (data.latestPopular ?? []).map((row) => ({
+          type: "featuredCarouselItem" as const,
+          mangaId: row.slug,
+          imageUrl: coverUrl(row.image),
+          title: row.title?.trim() || row.slug,
+          contentRating: contentRatingOf(row),
+          ...(typeof row.latestChapter === "number"
+            ? { supertitle: `Chapter ${row.latestChapter}` }
+            : {}),
+        })),
+        metadata: { completed: true },
+      };
+    }
+
+    const offset = paging?.offset ?? 0;
+
+    if (section.id === LATEST_SECTION_ID) {
+      return await this.latestUpdates(offset);
+    }
+
+    const sorted = SORTED_SECTIONS.find((entry) => entry.id === section.id);
+
+    if (!sorted) {
+      return { items: [] };
+    }
+
+    const data = await this.api.query<{ search?: ApiSearch }>(
+      `{search(x:${SOURCE},q:"",genre:"all",mod:${sorted.mod},limit:${PAGE_SIZE},offset:${offset},count:true){rows{${LIST_FIELDS}},count}}`,
+    );
+
+    const rows = data.search?.rows ?? [];
+    const total = data.search?.count ?? 0;
+    const nextOffset = offset + rows.length;
+
+    return {
+      items: rows.map((row) => ({
+        type: "simpleCarouselItem" as const,
+        mangaId: row.slug,
+        imageUrl: coverUrl(row.image),
+        title: row.title?.trim() || row.slug,
+        contentRating: contentRatingOf(row),
+        ...(typeof row.latestChapter === "number"
+          ? { subtitle: `Chapter ${row.latestChapter}` }
+          : {}),
+      })),
+      metadata:
+        rows.length > 0 && nextOffset < total ? { offset: nextOffset } : { completed: true },
+    };
+  }
+
+  private async latestUpdates(offset: number): Promise<PagedResults<DiscoverSectionItem>> {
+    const data = await this.api.query<{ latest?: ApiManga[] }>(
+      `{latest(x:${SOURCE},limit:${LATEST_PAGE_SIZE},offset:${offset}){id,title,slug,image,latestChapter,isSafe,isLicensed,updatedDate,chapters{id,number,title,date}}}`,
+    );
+
+    const rows = data.latest ?? [];
+    const items: DiscoverSectionItem[] = [];
+
+    for (const row of rows) {
+      const newest = [...(row.chapters ?? [])].sort((a, b) => b.number - a.number)[0];
+      const number = newest?.number ?? row.latestChapter;
+
+      if (typeof number !== "number") {
+        continue;
+      }
+
+      const published = newest?.date ? new Date(newest.date) : undefined;
+
+      items.push({
+        type: "chapterUpdatesCarouselItem",
+        mangaId: row.slug,
+        chapterId: String(number),
+        imageUrl: coverUrl(row.image),
+        title: row.title?.trim() || row.slug,
+        subtitle: `Chapter ${number}`,
+        contentRating: contentRatingOf(row),
+        ...(published && !Number.isNaN(published.getTime()) ? { publishDate: published } : {}),
+      });
+    }
+
+    return {
+      items,
+      metadata: items.length > 0 ? { offset: offset + rows.length } : { completed: true },
+    };
+  }
+
+  async cloudflareBypassCompleted(_request: Request, cookies: Cookie[]): Promise<void> {
+    for (const cookie of cookies) {
+      if (cookie.expires && cookie.expires.getTime() <= Date.now()) {
+        continue;
+      }
+
+      this.cookieStorage.setCookie(cookie);
+      // Also held on the interceptor, so clearance survives however the store
+      // parses its lifetime.
+      this.interceptor.setCookie(cookie.name, cookie.value);
+    }
+  }
+}
+
+export const Mangahub = new MangaHubExtension();
